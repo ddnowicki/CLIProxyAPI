@@ -292,6 +292,10 @@ func SafeResponseHeaders(err error) http.Header {
 		}
 		return nil
 	}
+	var poolCooldown *modelCooldownError
+	if errors.As(err, &poolCooldown) && poolCooldown != nil && !poolCooldown.resetAt.IsZero() {
+		return http.Header{"Retry-After": []string{strconv.Itoa(poolCooldown.resetSeconds())}}
+	}
 	var trusted *trustedRetryAfterError
 	if errors.As(err, &trusted) && trusted != nil {
 		return trusted.SafeResponseHeaders()
@@ -310,7 +314,10 @@ func SafeResponseHeaders(err error) http.Header {
 	}
 	var modelCooldown *modelCooldownError
 	if errors.As(err, &modelCooldown) && modelCooldown != nil {
-		return modelCooldown.Headers()
+		return http.Header{
+			"Content-Type": []string{"application/json"},
+			"Retry-After":  []string{strconv.Itoa(modelCooldown.resetSeconds())},
+		}
 	}
 	var unavailable *authUnavailableError
 	if errors.As(err, &unavailable) && unavailable != nil {

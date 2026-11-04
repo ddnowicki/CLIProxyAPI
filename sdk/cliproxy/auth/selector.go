@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -84,6 +85,7 @@ const (
 type modelCooldownError struct {
 	model    string
 	resetIn  time.Duration
+	resetAt  time.Time
 	provider string
 	cause    error
 }
@@ -129,16 +131,9 @@ func (e *modelCooldownError) Error() string {
 	if e.provider != "" {
 		message = fmt.Sprintf("%s via provider %s", message, e.provider)
 	}
-	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
-	if resetSeconds < 0 {
-		resetSeconds = 0
-	}
-	displayDuration := e.resetIn
-	if displayDuration > 0 && displayDuration < time.Second {
-		displayDuration = time.Second
-	} else {
-		displayDuration = displayDuration.Round(time.Second)
-	}
+	resetSeconds := e.resetSeconds()
+	message += fmt.Sprintf(" (reset after %ds)", resetSeconds)
+	displayDuration := time.Duration(resetSeconds) * time.Second
 	errorBody := map[string]any{
 		"code":          "model_cooldown",
 		"message":       message,
@@ -351,14 +346,28 @@ func (e *modelCooldownError) StatusCode() int {
 	return http.StatusTooManyRequests
 }
 
+func (e *modelCooldownError) resetSeconds() int {
+	remaining := e.resetIn
+	if !e.resetAt.IsZero() {
+		remaining = time.Until(e.resetAt)
+	}
+	return max(0, int(math.Ceil(remaining.Seconds())))
+}
+
+func (e *modelCooldownError) ResponseBody() []byte {
+	return []byte(e.Error())
+}
+
 func (e *modelCooldownError) Headers() http.Header {
 	headers := make(http.Header)
-	headers.Set("Content-Type", "application/json")
-	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
-	if resetSeconds < 0 {
-		resetSeconds = 0
+	var carrier interface{ Headers() http.Header }
+	if errors.As(e.cause, &carrier) && carrier != nil {
+		for key, values := range carrier.Headers() {
+			headers[key] = append([]string(nil), values...)
+		}
 	}
-	headers.Set("Retry-After", strconv.Itoa(resetSeconds))
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Retry-After", strconv.Itoa(e.resetSeconds()))
 	return headers
 }
 
@@ -834,9 +843,20 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
 		return true, blockReasonOther, time.Time{}
 	}
-	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
-		return true, blockReasonCooldown, auth.Quota.NextRecoverAt
+	blocked, reason, next := modelAvailabilityBlock(auth, model, now)
+	if blocked && next.IsZero() {
+		return blocked, reason, next
 	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" {
+		globalBlocked, globalReason, globalNext := availabilityBlock(auth.Unavailable, true, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
+		if globalBlocked && (!blocked || globalNext.IsZero() || globalNext.After(next)) {
+			return globalBlocked, globalReason, globalNext
+		}
+	}
+	return blocked, reason, next
+}
+
+func modelAvailabilityBlock(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			modelKey := canonicalModelKey(model)
