@@ -20,6 +20,10 @@ auths
 logs
 conv
 config.yaml
+.env
+.env.*
+**/.env
+**/.env.*
 
 # Development/editor
 bin

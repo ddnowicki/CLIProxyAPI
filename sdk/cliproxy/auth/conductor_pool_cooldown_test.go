@@ -76,6 +76,25 @@ func TestPoolCooldownCombinesGlobalAndModelBlocks(t *testing.T) {
 	}
 }
 
+func TestSharedCooldownHelpersAcrossProviders(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	for _, provider := range []string{"claude", "codex", "grok"} {
+		t.Run(provider, func(t *testing.T) {
+			auth := poolCooldownTestAuth("shared-"+provider, now.Add(2*time.Hour))
+			auth.Provider = provider
+			auth.Quota = QuotaState{Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(time.Hour)}
+			blocked, reason, next := isAuthBlockedForModel(auth, "claude-opus-5-5", now)
+			if !blocked || reason != blockReasonCooldown || !next.Equal(now.Add(2*time.Hour)) {
+				t.Fatalf("shared block calculation differs for %s", provider)
+			}
+			err := newModelCooldownError("test-model", provider, time.Hour)
+			if err.StatusCode() != 429 || ojson.Get(err.Error(), "error.code").String() != "model_cooldown" || err.Headers().Get("Retry-After") != "3600" {
+				t.Fatalf("shared cooldown contract changed for %s", provider)
+			}
+		})
+	}
+}
+
 func poolCooldownTestAuth(id string, deadline time.Time) *Auth {
 	return &Auth{
 		ID: id, Provider: "claude", Status: StatusActive,
@@ -235,11 +254,28 @@ func TestPoolCooldownAliasPoolDoesNotRotate(t *testing.T) {
 	}
 }
 
-type poolCooldownHeaderError struct{}
+type poolCooldownHeaderError struct{ headers http.Header }
 
 func (poolCooldownHeaderError) Error() string { return "synthetic upstream rejection" }
-func (poolCooldownHeaderError) Headers() http.Header {
-	return http.Header{"X-Request-Id": []string{"synthetic-request"}, "Retry-After": []string{"86400"}}
+func (e poolCooldownHeaderError) Headers() http.Header {
+	if e.headers != nil {
+		return e.headers
+	}
+	return http.Header{
+		"x-request-id":                      []string{"synthetic-request"},
+		"Request-Id":                        []string{"synthetic-provider-request"},
+		"Retry-After":                       []string{"86400"},
+		"Set-Cookie":                        []string{"synthetic-cookie"},
+		"set-cookie":                        []string{"synthetic-lowercase-cookie"},
+		"Authorization":                     []string{"synthetic-auth"},
+		"Proxy-Authorization":               []string{"synthetic-proxy-auth"},
+		"Connection":                        []string{"X-Internal-Secret"},
+		"X-Internal-Secret":                 []string{"synthetic-secret"},
+		"Access-Control-Allow-Origin":       []string{"*"},
+		"Content-Length":                    []string{"999999"},
+		"Content-Encoding":                  []string{"gzip"},
+		"Anthropic-Ratelimit-Unified-Reset": []string{"9999999999"},
+	}
 }
 
 func TestPoolCooldownPreservesUpstreamHeaders(t *testing.T) {
@@ -250,8 +286,35 @@ func TestPoolCooldownPreservesUpstreamHeaders(t *testing.T) {
 	if got := err.Headers().Get("Retry-After"); got != "60" {
 		t.Fatalf("upstream deadline overrode pool: %q", got)
 	}
+	if got := err.Headers().Get("Request-Id"); got != "synthetic-provider-request" {
+		t.Fatalf("upstream request ID lost: %q", got)
+	}
+	for key := range err.Headers() {
+		switch key {
+		case "Request-Id", "X-Request-Id", "Content-Type", "Retry-After":
+		default:
+			t.Fatalf("non-allowlisted upstream header forwarded: %s", key)
+		}
+	}
 	if got := SafeResponseHeaders(err).Get("X-Request-Id"); got != "" {
 		t.Fatalf("unsafe upstream header forwarded without passthrough: %q", got)
+	}
+}
+
+func TestPoolCooldownDropsConnectionScopedRequestIDs(t *testing.T) {
+	upstream := http.Header{
+		"connection":   []string{" request-id, X-Request-ID "},
+		"Request-Id":   []string{"synthetic-request"},
+		"x-request-id": []string{"synthetic-other-request"},
+	}
+	err := &modelCooldownError{resetIn: time.Minute, cause: poolCooldownHeaderError{headers: upstream}}
+	for _, key := range []string{"Request-Id", "X-Request-Id", "Connection"} {
+		if got := err.Headers().Get(key); got != "" {
+			t.Fatalf("connection-scoped header %s forwarded: %q", key, got)
+		}
+	}
+	if upstream.Get("Request-Id") != "synthetic-request" {
+		t.Fatal("upstream header map mutated")
 	}
 }
 

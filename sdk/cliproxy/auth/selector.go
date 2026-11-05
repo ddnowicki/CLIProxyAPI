@@ -362,8 +362,23 @@ func (e *modelCooldownError) Headers() http.Header {
 	headers := make(http.Header)
 	var carrier interface{ Headers() http.Header }
 	if errors.As(e.cause, &carrier) && carrier != nil {
-		for key, values := range carrier.Headers() {
-			headers[key] = append([]string(nil), values...)
+		upstream := carrier.Headers()
+		connectionScoped := make(map[string]bool)
+		for key, values := range upstream {
+			if !strings.EqualFold(key, "Connection") {
+				continue
+			}
+			for _, value := range values {
+				for _, token := range strings.Split(value, ",") {
+					connectionScoped[http.CanonicalHeaderKey(strings.TrimSpace(token))] = true
+				}
+			}
+		}
+		for key, values := range upstream {
+			canonical := http.CanonicalHeaderKey(key)
+			if !connectionScoped[canonical] && (canonical == "Request-Id" || canonical == "X-Request-Id") {
+				headers[canonical] = append(headers[canonical], values...)
+			}
 		}
 	}
 	headers.Set("Content-Type", "application/json")
