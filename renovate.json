@@ -1,0 +1,28 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+  "forkProcessing": "enabled",
+  "baseBranchPatterns": ["master"],
+  "enabledManagers": ["gomod", "dockerfile", "github-actions"],
+  "dependencyDashboard": true,
+  "timezone": "Europe/Warsaw",
+  "minimumReleaseAge": "3 days",
+  "prConcurrentLimit": 3,
+  "prHourlyLimit": 2,
+  "automerge": false,
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Go dependencies"
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "minimumReleaseAge": null,
+    "labels": ["security"]
+  }
+}

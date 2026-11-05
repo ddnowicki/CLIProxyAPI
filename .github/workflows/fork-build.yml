@@ -1,0 +1,88 @@
+name: fork-build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.repository == 'ddnowicki/CLIProxyAPI'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        run: go test -count=1 -skip '^TestToolSearchDisabledMatchesDevGolden$' ./...
+      - name: Race regressions
+        run: go test -race -count=1 -run 'Test(PoolCooldown|ModelCooldownErrorClientReset|TerminalPoolCooldown|ClaudePoolCooldown|SharedCooldown)' ./sdk/cliproxy/auth ./sdk/api/handlers/claude
+      - name: Build
+        run: go build -buildvcs=false -o /tmp/cli-proxy-api ./cmd/server
+
+  image:
+    needs: test
+    if: github.repository == 'ddnowicki/CLIProxyAPI' && github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Image metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < .github/upstream-version)"
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "version=${version}-pool-reset-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish tested image
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/ddnowicki/cliproxyapi:sha-${{ github.sha }}
+            ghcr.io/ddnowicki/cliproxyapi:master
+          labels: |
+            org.opencontainers.image.source=https://github.com/ddnowicki/CLIProxyAPI
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Record immutable image
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          echo "ghcr.io/ddnowicki/cliproxyapi:master@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"

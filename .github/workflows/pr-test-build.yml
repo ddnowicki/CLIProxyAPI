@@ -8,6 +8,7 @@ permissions:
 
 jobs:
   build:
+    if: github.repository == 'router-for-me/CLIProxyAPI'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
