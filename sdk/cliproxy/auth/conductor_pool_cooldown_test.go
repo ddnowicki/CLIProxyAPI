@@ -3,377 +3,457 @@ package auth
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/MoeForge/moego/ojson"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-func TestModelCooldownErrorClientReset(t *testing.T) {
-	for _, duration := range []time.Duration{0, time.Millisecond, 3723*time.Second + time.Millisecond, 27 * time.Hour} {
-		t.Run(duration.String(), func(t *testing.T) {
-			err := newModelCooldownErrorWithCause("claude-opus-5-5", "claude", duration, errors.New("upstream (reset after 999999s)"))
-			seconds := err.resetSeconds()
-			message := ojson.Get(err.Error(), "error.message").String()
-			want := fmt.Sprintf("(reset after %ds)", seconds)
-			if !strings.Contains(message, want) || strings.Index(message, want) > strings.Index(message, "last error") {
-				t.Fatalf("trusted reset must precede upstream diagnostic: %s", message)
-			}
-			if got := err.Headers().Get("Retry-After"); got != fmt.Sprint(seconds) {
-				t.Fatalf("Retry-After=%s, want %d", got, seconds)
-			}
-			if got := ojson.Get(err.Error(), "error.reset_seconds").Int(); got != int64(seconds) {
-				t.Fatalf("reset_seconds=%d, want %d", got, seconds)
-			}
-			if string(err.ResponseBody()) != err.Error() {
-				t.Fatal("response body discarded pool error")
-			}
+const issue7521PoolModel = "claude-sonnet-4-6-issue-7521"
+
+func newIssue7521Manager(
+	t *testing.T,
+	selector Selector,
+	exec ProviderExecutor,
+	auths ...*Auth,
+) *Manager {
+	t.Helper()
+	withQuotaCooldownEnabled(t)
+	if selector == nil {
+		selector = &RoundRobinSelector{}
+	}
+	manager := NewManager(nil, selector, nil)
+	manager.SetRetryConfig(2, 30*time.Second, 0)
+	manager.RegisterExecutor(exec)
+	reg := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		authID := auth.ID
+		reg.RegisterClient(authID, auth.Provider, []*registry.ModelInfo{{ID: issue7521PoolModel}})
+		t.Cleanup(func() {
+			reg.UnregisterClient(authID)
 		})
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", authID, errRegister)
+		}
 	}
-	err := &modelCooldownError{resetIn: time.Hour, resetAt: time.Now().Add(-time.Second)}
-	if err.resetSeconds() != 0 || err.Headers().Get("Retry-After") != "0" {
-		t.Fatal("expired absolute deadline must not re-advertise original duration")
-	}
+	return manager
 }
 
-func TestPoolCooldownCombinesGlobalAndModelBlocks(t *testing.T) {
-	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
-	for _, tc := range []struct {
-		name          string
-		global, model time.Duration
-		want          time.Duration
-	}{
-		{"model outlives global", time.Hour, 3 * time.Hour, 3 * time.Hour},
-		{"global outlives model", 3 * time.Hour, time.Hour, 3 * time.Hour},
-		{"expired global", -time.Hour, time.Hour, time.Hour},
-		{"global with available model", time.Hour, -time.Hour, time.Hour},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			auth := poolCooldownTestAuth("combined", now.Add(tc.model))
-			auth.Quota = QuotaState{Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(tc.global)}
-			blocked, reason, next := isAuthBlockedForModel(auth, "claude-opus-5-5", now)
-			if !blocked || reason != blockReasonCooldown || !next.Equal(now.Add(tc.want)) {
-				t.Fatalf("got (%v,%v,%v), want quota until %v", blocked, reason, next, now.Add(tc.want))
-			}
-		})
-	}
-	auth := poolCooldownTestAuth("disabled-model", now.Add(time.Hour))
-	auth.Quota = QuotaState{Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(2 * time.Hour)}
-	auth.ModelStates["claude-opus-5-5"].Status = StatusDisabled
-	if _, reason, next := isAuthBlockedForModel(auth, "claude-opus-5-5", now); reason != blockReasonDisabled || !next.IsZero() {
-		t.Fatal("disabled model must not be advertised as recovering at quota reset")
-	}
-	auth.ModelStates["claude-opus-5-5"].Status = StatusActive
-	auth.Quota.NextRecoverAt = time.Time{}
-	if blocked, _, next := isAuthBlockedForModel(auth, "claude-opus-5-5", now); !blocked || !next.IsZero() {
-		t.Fatal("unknown global reset must not be hidden by a known model reset")
-	}
-}
-
-func TestSharedCooldownHelpersAcrossProviders(t *testing.T) {
-	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
-	for _, provider := range []string{"claude", "codex", "grok"} {
-		t.Run(provider, func(t *testing.T) {
-			auth := poolCooldownTestAuth("shared-"+provider, now.Add(2*time.Hour))
-			auth.Provider = provider
-			auth.Quota = QuotaState{Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(time.Hour)}
-			blocked, reason, next := isAuthBlockedForModel(auth, "claude-opus-5-5", now)
-			if !blocked || reason != blockReasonCooldown || !next.Equal(now.Add(2*time.Hour)) {
-				t.Fatalf("shared block calculation differs for %s", provider)
-			}
-			err := newModelCooldownError("test-model", provider, time.Hour)
-			if err.StatusCode() != 429 || ojson.Get(err.Error(), "error.code").String() != "model_cooldown" || err.Headers().Get("Retry-After") != "3600" {
-				t.Fatalf("shared cooldown contract changed for %s", provider)
-			}
-		})
-	}
-}
-
-func poolCooldownTestAuth(id string, deadline time.Time) *Auth {
+func newIssue7521Auth(id string) *Auth {
 	return &Auth{
-		ID: id, Provider: "claude", Status: StatusActive,
-		ModelStates: map[string]*ModelState{
-			"claude-opus-5-5": {
-				Status: StatusError, Unavailable: true, NextRetryAfter: deadline,
-				Quota: QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: deadline},
+		ID:         id,
+		Provider:   "claude",
+		Status:     StatusActive,
+		Attributes: map[string]string{"api_key": "key-" + id},
+	}
+}
+
+func newIssue7521Upstream429(msg string, retryAfter time.Duration) error {
+	hint := retryAfter
+	return customStatusError{
+		code:       http.StatusTooManyRequests,
+		msg:        msg,
+		retryAfter: &hint,
+	}
+}
+
+func assertIssue7521PoolCooldownError(t *testing.T, err error, wantMessage string, wantDeadline time.Duration) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected terminal 429 error, got nil")
+	}
+	if got := statusCodeFromError(err); got != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", got)
+	}
+	if !strings.Contains(err.Error(), wantMessage) {
+		t.Fatalf("error = %q, want upstream message %q preserved", err.Error(), wantMessage)
+	}
+	var marker interface{ IsModelCooldown() bool }
+	if !errors.As(err, &marker) || marker == nil || !marker.IsModelCooldown() {
+		t.Fatalf("error %T (%v) must report IsModelCooldown() == true", err, err)
+	}
+	if !HasTrustedRetryDeadline(err) {
+		t.Fatal("HasTrustedRetryDeadline(err) = false, want true")
+	}
+	retryAfter := SafeResponseHeaders(err).Get("Retry-After")
+	seconds, errParse := strconv.ParseInt(retryAfter, 10, 64)
+	if errParse != nil || seconds <= 0 {
+		t.Fatalf("Retry-After = %q, want positive integer seconds", retryAfter)
+	}
+	gotDuration := time.Duration(seconds) * time.Second
+	if gotDuration > wantDeadline+10*time.Second || gotDuration < wantDeadline-10*time.Second {
+		t.Fatalf("Retry-After = %ds (%s), want near pool recovery %s", seconds, gotDuration, wantDeadline)
+	}
+}
+
+// Variant 2: fresh start where every candidate credential is tried in the same
+// round and returns 429; no modelCooldownError is built during selection, yet
+// the terminal 429 must report IsModelCooldown() and carry the earliest pool reset.
+func TestExecuteLastCredential429CarriesEarliestPoolReset(t *testing.T) {
+	first := newIssue7521Auth("7521-exec-a")
+	second := newIssue7521Auth("7521-exec-b")
+	shortHint := 90 * time.Minute
+	longHint := 3 * time.Hour
+
+	var attempts []string
+	exec := &customStreamMockExecutor{
+		identifier: "claude",
+		mockCustomErrorExecutor: mockCustomErrorExecutor{
+			identifier: "claude",
+			executeFn: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				attempts = append(attempts, auth.ID)
+				if auth.ID == first.ID {
+					return cliproxyexecutor.Response{}, newIssue7521Upstream429("first credential rate limited", shortHint)
+				}
+				return cliproxyexecutor.Response{}, newIssue7521Upstream429("monthly spend limit reached", longHint)
 			},
 		},
 	}
-}
+	manager := newIssue7521Manager(t, nil, exec, first, second)
 
-func poolCooldownTestManager(t *testing.T, auths ...*Auth) *Manager {
-	t.Helper()
-	m := NewManager(nil, &FillFirstSelector{}, nil)
-	m.RegisterExecutor(&poolCooldownExecutor{})
-	reg := registry.GetGlobalRegistry()
-	for _, auth := range auths {
-		reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "claude-opus-5-5"}})
-		t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
-		m.auths[auth.ID] = auth
-	}
-	return m
-}
-
-func TestPoolCooldownDeadlineEligibility(t *testing.T) {
-	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
-	for _, tc := range []struct {
-		name   string
-		mutate func(*Manager, *Auth, *Auth)
-		opts   cliproxyexecutor.Options
-		want   time.Duration
-		known  bool
-	}{
-		{name: "earliest account", want: time.Hour, known: true},
-		{name: "disabled account ignored", mutate: func(_ *Manager, a, _ *Auth) { a.Disabled = true }, want: 3 * time.Hour, known: true},
-		{name: "unsupported account ignored", mutate: func(_ *Manager, a, _ *Auth) {
-			registry.GetGlobalRegistry().RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: "claude-haiku-5-5"}})
-		}, want: 3 * time.Hour, known: true},
-		{name: "available account prevents pool cooldown", mutate: func(_ *Manager, a, _ *Auth) { a.ModelStates = nil }},
-		{name: "expired deadline is available", mutate: func(_ *Manager, a, _ *Auth) {
-			a.ModelStates["claude-opus-5-5"].NextRetryAfter = now.Add(-time.Hour)
-			a.ModelStates["claude-opus-5-5"].Quota.NextRecoverAt = now.Add(-time.Hour)
-		}},
-		{name: "unknown deadline is not available", mutate: func(_ *Manager, a, _ *Auth) {
-			a.ModelStates["claude-opus-5-5"].NextRetryAfter = time.Time{}
-			a.ModelStates["claude-opus-5-5"].Quota.NextRecoverAt = time.Time{}
-		}, want: 3 * time.Hour, known: true},
-		{name: "no registered executor", mutate: func(m *Manager, _, _ *Auth) { m.executors = nil }},
-		{name: "weighted zero account ignored", mutate: func(m *Manager, a, _ *Auth) {
-			m.selector = &WeightedRoundRobinSelector{}
-			a.Attributes = map[string]string{"weight": "0"}
-		}, want: 3 * time.Hour, known: true},
-		{name: "weighted affinity zero account ignored", mutate: func(m *Manager, a, _ *Auth) {
-			m.selector = NewSessionAffinitySelector(&WeightedRoundRobinSelector{})
-			a.Attributes = map[string]string{"weight": "0"}
-		}, want: 3 * time.Hour, known: true},
-		{name: "pinned account", opts: cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: "pool-pinned account-b"}}, want: 3 * time.Hour, known: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := poolCooldownTestAuth("pool-"+tc.name+"-a", now.Add(time.Hour))
-			b := poolCooldownTestAuth("pool-"+tc.name+"-b", now.Add(3*time.Hour))
-			m := poolCooldownTestManager(t, a, b)
-			if tc.mutate != nil {
-				tc.mutate(m, a, b)
-			}
-			deadline, known := m.poolCooldownDeadline(context.Background(), []string{"claude"}, "claude-opus-5-5", tc.opts, now)
-			if known != tc.known || (known && !deadline.Equal(now.Add(tc.want))) {
-				t.Fatalf("deadline=%v known=%v, want offset=%v known=%v", deadline, known, tc.want, tc.known)
-			}
-		})
+	_, errExec := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: issue7521PoolModel}, cliproxyexecutor.Options{})
+	assertIssue7521PoolCooldownError(t, errExec, "monthly spend limit reached", shortHint)
+	if len(attempts) != 2 {
+		t.Fatalf("attempts = %v, want 2 credentials tried", attempts)
 	}
 }
 
-func TestPoolCooldownResolvesOAuthAlias(t *testing.T) {
-	now := time.Now()
-	a := poolCooldownTestAuth("pool-alias", now.Add(time.Hour))
-	m := poolCooldownTestManager(t, a)
-	m.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{"claude": {{Name: "claude-opus-5-5", Alias: "my-opus"}}})
-	deadline, known := m.poolCooldownDeadline(context.Background(), []string{"claude"}, "my-opus", cliproxyexecutor.Options{}, now)
-	if !known || !deadline.Equal(now.Add(time.Hour)) {
-		t.Fatalf("alias deadline=%v known=%v", deadline, known)
+func TestExecuteSingleCredentialSubFloorHintReportsActualPoolRecovery(t *testing.T) {
+	single := newIssue7521Auth("7521-subfloor-a")
+	hint := 7 * time.Second
+	exec := &customStreamMockExecutor{
+		identifier: "claude",
+		mockCustomErrorExecutor: mockCustomErrorExecutor{
+			identifier: "claude",
+			executeFn: func(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return cliproxyexecutor.Response{}, newIssue7521Upstream429("try later", hint)
+			},
+		},
+	}
+	manager := newIssue7521Manager(t, nil, exec, single)
+	manager.SetRetryConfig(0, 0, 0)
+
+	_, errExec := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: issue7521PoolModel}, cliproxyexecutor.Options{})
+	if errExec == nil {
+		t.Fatal("expected terminal 429 error")
+	}
+	// MarkResult clamps the 7s hint up to minQuotaCooldownFloor (10s), so the
+	// pool's actual recovery is 10s out. The wrap must advertise that real
+	// deadline, not the shorter per-attempt hint.
+	if got := SafeResponseHeaders(errExec).Get("Retry-After"); got != "10" {
+		t.Fatalf("Retry-After = %q, want 10 (minQuotaCooldownFloor)", got)
+	}
+	var marker interface{ IsModelCooldown() bool }
+	if !errors.As(errExec, &marker) || marker == nil || !marker.IsModelCooldown() {
+		t.Fatalf("error %T must report IsModelCooldown() == true", errExec)
 	}
 }
 
-func TestTerminalPoolCooldownHeaderOverridesLastAttempt(t *testing.T) {
-	now := time.Now()
-	m := poolCooldownTestManager(t, poolCooldownTestAuth("pool-header", now.Add(time.Minute)))
-	lastHint := 24 * time.Hour
-	last := withTrustedRetryAfter(&Error{HTTPStatus: 429, Message: "upstream last account"}, &lastHint)
-	err := m.terminalPoolCooldownError(context.Background(), []string{"claude"}, "claude-opus-5-5", cliproxyexecutor.Options{}, last)
-	var pooled *modelCooldownError
-	if !errors.As(err, &pooled) || pooled.resetAt.IsZero() || !errors.Is(err, last) {
-		t.Fatalf("expected pool summary retaining last error: %v", err)
+// Variant 1: one credential is already cooling down; the remaining credential
+// returns 429 and the next pick fails with modelCooldownError, which is
+// replaced by preferredExecutionAttemptError. The terminal 429 must still keep
+// the upstream text and carry the earliest pool cooldown reset.
+func TestExecuteLastUsableCredential429KeepsExistingCooldownReset(t *testing.T) {
+	first := newIssue7521Auth("7521-var1-a")
+	second := newIssue7521Auth("7521-var1-b")
+	existingCooldown := 75 * time.Minute
+	freshHint := 3 * time.Hour
+
+	exec := &customStreamMockExecutor{
+		identifier: "claude",
+		mockCustomErrorExecutor: mockCustomErrorExecutor{
+			identifier: "claude",
+			executeFn: func(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return cliproxyexecutor.Response{}, newIssue7521Upstream429("second credential rate limited", freshHint)
+			},
+		},
 	}
-	if got := SafeResponseHeaders(err).Get("Retry-After"); got != "60" {
-		t.Fatalf("last attempt replaced pool deadline: Retry-After=%s", got)
-	}
-	for _, original := range []error{&Error{HTTPStatus: 503}, &requestScopedStatusError{status: 429}} {
-		if got := m.terminalPoolCooldownError(context.Background(), []string{"claude"}, "claude-opus-5-5", cliproxyexecutor.Options{}, original); got != original {
-			t.Fatalf("must preserve non-quota/request-scoped error: %v", got)
-		}
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if got := m.terminalPoolCooldownError(ctx, []string{"claude"}, "claude-opus-5-5", cliproxyexecutor.Options{}, last); got != last {
-		t.Fatal("must preserve cancellation")
-	}
+	manager := newIssue7521Manager(t, nil, exec, first, second)
+	manager.MarkResult(context.Background(), Result{
+		AuthID:          first.ID,
+		Provider:        "claude",
+		Model:           issue7521PoolModel,
+		Success:         false,
+		RetryAfter:      &existingCooldown,
+		CredentialScope: true,
+		Error:           &Error{HTTPStatus: http.StatusTooManyRequests, Message: "already cooling"},
+	})
+
+	_, errExec := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: issue7521PoolModel}, cliproxyexecutor.Options{})
+	assertIssue7521PoolCooldownError(t, errExec, "second credential rate limited", existingCooldown)
 }
 
-type poolCooldownExecutor struct {
-	hints     map[string]time.Duration
-	bootstrap bool
-}
+func TestExecuteCountLastCredential429CarriesEarliestPoolReset(t *testing.T) {
+	first := newIssue7521Auth("7521-count-a")
+	second := newIssue7521Auth("7521-count-b")
+	shortHint := 85 * time.Minute
+	longHint := 4 * time.Hour
 
-func (*poolCooldownExecutor) Identifier() string                                { return "claude" }
-func (*poolCooldownExecutor) Refresh(_ context.Context, a *Auth) (*Auth, error) { return a, nil }
-func (*poolCooldownExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
-	return nil, nil
-}
-func (e *poolCooldownExecutor) Execute(_ context.Context, a *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	hint := e.hints[a.ID]
-	return cliproxyexecutor.Response{}, issue7017HintError{msg: "synthetic capacity rejection", hint: &hint}
-}
-func (e *poolCooldownExecutor) CountTokens(ctx context.Context, a *Auth, r cliproxyexecutor.Request, o cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return e.Execute(ctx, a, r, o)
-}
-func (e *poolCooldownExecutor) ExecuteStream(ctx context.Context, a *Auth, r cliproxyexecutor.Request, o cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	_, err := e.Execute(ctx, a, r, o)
-	if !e.bootstrap {
-		return nil, err
-	}
-	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
-	chunks <- cliproxyexecutor.StreamChunk{Err: err}
-	close(chunks)
-	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
-}
-
-func TestPoolCooldownAliasPoolDoesNotRotate(t *testing.T) {
-	now := time.Now()
-	m := newOpenAICompatPoolTestManager(t, "public", []internalconfig.OpenAICompatibilityModel{
-		{Name: "upstream-a", Alias: "public"},
-		{Name: "upstream-b", Alias: "public"},
-	}, nil)
-	for _, a := range m.auths {
-		a.ModelStates = map[string]*ModelState{
-			"upstream-a": {Unavailable: true, NextRetryAfter: now.Add(time.Minute), Quota: QuotaState{Exceeded: true, NextRecoverAt: now.Add(time.Minute)}},
-			"upstream-b": {Unavailable: true, NextRetryAfter: now.Add(time.Hour), Quota: QuotaState{Exceeded: true, NextRecoverAt: now.Add(time.Hour)}},
-		}
-	}
-	deadline, known := m.poolCooldownDeadline(context.Background(), []string{openAICompatPoolProviderKey}, "public", cliproxyexecutor.Options{}, now)
-	if !known || !deadline.Equal(now.Add(time.Minute)) {
-		t.Fatalf("pooled alias deadline=%v known=%v", deadline, known)
-	}
-	if len(m.modelPoolOffsets) != 0 {
-		t.Fatal("read-only availability calculation rotated execution pool")
-	}
-}
-
-type poolCooldownHeaderError struct{ headers http.Header }
-
-func (poolCooldownHeaderError) Error() string { return "synthetic upstream rejection" }
-func (e poolCooldownHeaderError) Headers() http.Header {
-	if e.headers != nil {
-		return e.headers
-	}
-	return http.Header{
-		"x-request-id":                      []string{"synthetic-request"},
-		"Request-Id":                        []string{"synthetic-provider-request"},
-		"Retry-After":                       []string{"86400"},
-		"Set-Cookie":                        []string{"synthetic-cookie"},
-		"set-cookie":                        []string{"synthetic-lowercase-cookie"},
-		"Authorization":                     []string{"synthetic-auth"},
-		"Proxy-Authorization":               []string{"synthetic-proxy-auth"},
-		"Connection":                        []string{"X-Internal-Secret"},
-		"X-Internal-Secret":                 []string{"synthetic-secret"},
-		"Access-Control-Allow-Origin":       []string{"*"},
-		"Content-Length":                    []string{"999999"},
-		"Content-Encoding":                  []string{"gzip"},
-		"Anthropic-Ratelimit-Unified-Reset": []string{"9999999999"},
-	}
-}
-
-func TestPoolCooldownPreservesUpstreamHeaders(t *testing.T) {
-	err := &modelCooldownError{resetIn: time.Minute, resetAt: time.Now().Add(time.Minute), cause: poolCooldownHeaderError{}}
-	if got := err.Headers().Get("X-Request-Id"); got != "synthetic-request" {
-		t.Fatalf("upstream request ID lost: %q", got)
-	}
-	if got := err.Headers().Get("Retry-After"); got != "60" {
-		t.Fatalf("upstream deadline overrode pool: %q", got)
-	}
-	if got := err.Headers().Get("Request-Id"); got != "synthetic-provider-request" {
-		t.Fatalf("upstream request ID lost: %q", got)
-	}
-	for key := range err.Headers() {
-		switch key {
-		case "Request-Id", "X-Request-Id", "Content-Type", "Retry-After":
-		default:
-			t.Fatalf("non-allowlisted upstream header forwarded: %s", key)
-		}
-	}
-	if got := SafeResponseHeaders(err).Get("X-Request-Id"); got != "" {
-		t.Fatalf("unsafe upstream header forwarded without passthrough: %q", got)
-	}
-}
-
-func TestPoolCooldownDropsConnectionScopedRequestIDs(t *testing.T) {
-	upstream := http.Header{
-		"connection":   []string{" request-id, X-Request-ID "},
-		"Request-Id":   []string{"synthetic-request"},
-		"x-request-id": []string{"synthetic-other-request"},
-	}
-	err := &modelCooldownError{resetIn: time.Minute, cause: poolCooldownHeaderError{headers: upstream}}
-	for _, key := range []string{"Request-Id", "X-Request-Id", "Connection"} {
-		if got := err.Headers().Get(key); got != "" {
-			t.Fatalf("connection-scoped header %s forwarded: %q", key, got)
-		}
-	}
-	if upstream.Get("Request-Id") != "synthetic-request" {
-		t.Fatal("upstream header map mutated")
-	}
-}
-
-func TestTerminalPoolCooldownLeavesOtherProvidersUnchanged(t *testing.T) {
-	m := poolCooldownTestManager(t, poolCooldownTestAuth("provider-scope", time.Now().Add(time.Hour)))
-	original := &Error{HTTPStatus: 429, Message: "synthetic provider error"}
-	for _, providers := range [][]string{{"codex"}, {"claude", "codex"}, {"plugin-provider"}} {
-		if got := m.terminalPoolCooldownError(context.Background(), providers, "claude-opus-5-5", cliproxyexecutor.Options{}, original); got != original {
-			t.Fatalf("changed non-Claude execution for %v", providers)
-		}
-	}
-}
-
-func TestTerminalPoolCooldownAcrossExecutionModes(t *testing.T) {
-	for _, mode := range []string{"execute", "count", "stream", "stream-bootstrap"} {
-		t.Run(mode, func(t *testing.T) {
-			withQuotaCooldownEnabled(t)
-			m := NewManager(nil, &FillFirstSelector{}, nil)
-			m.SetRetryConfig(0, 0, 0)
-			executor := &poolCooldownExecutor{hints: map[string]time.Duration{"pool-" + mode + "-a": time.Minute, "pool-" + mode + "-z": time.Hour}, bootstrap: mode == "stream-bootstrap"}
-			m.RegisterExecutor(executor)
-			for id := range executor.hints {
-				registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: "claude-opus-5-5"}})
-				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
-				if _, err := m.Register(WithSkipPersist(context.Background()), &Auth{ID: id, Provider: "claude"}); err != nil {
-					t.Fatal(err)
+	exec := &customStreamMockExecutor{
+		identifier: "claude",
+		mockCustomErrorExecutor: mockCustomErrorExecutor{
+			identifier: "claude",
+			countFn: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				if auth.ID == first.ID {
+					return cliproxyexecutor.Response{}, newIssue7521Upstream429("count first limited", shortHint)
 				}
-			}
-			req := cliproxyexecutor.Request{Model: "claude-opus-5-5"}
-			var err error
-			switch mode {
-			case "execute":
-				_, err = m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{})
-			case "count":
-				_, err = m.ExecuteCount(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{})
-			default:
-				var result *cliproxyexecutor.StreamResult
-				result, err = m.ExecuteStream(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{Stream: true})
-				if err == nil && result != nil {
-					for chunk := range result.Chunks {
-						if chunk.Err != nil {
-							err = chunk.Err
-						}
-					}
-				}
-			}
-			if err == nil {
-				t.Fatal("expected terminal rejection")
-			}
-			if got := SafeResponseHeaders(err).Get("Retry-After"); got != "60" {
-				t.Fatalf("Retry-After=%q, want earliest account 60, err=%v", got, err)
-			}
-			if !strings.Contains(err.Error(), "(reset after 60s)") {
-				t.Fatalf("missing client-readable reset: %v", err)
-			}
-			var body interface{ ResponseBody() []byte }
-			if !errors.As(err, &body) || !strings.Contains(string(body.ResponseBody()), "(reset after 60s)") {
-				t.Fatal("Claude error normalization must see the pool error body")
-			}
-		})
+				return cliproxyexecutor.Response{}, newIssue7521Upstream429("count second limited", longHint)
+			},
+		},
 	}
+	manager := newIssue7521Manager(t, nil, exec, first, second)
+
+	_, errCount := manager.ExecuteCount(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: issue7521PoolModel}, cliproxyexecutor.Options{})
+	assertIssue7521PoolCooldownError(t, errCount, "count second limited", shortHint)
+}
+
+func TestExecuteStreamLastCredential429CarriesEarliestPoolReset(t *testing.T) {
+	shortHint := 80 * time.Minute
+	longHint := 3 * time.Hour
+
+	t.Run("direct stream error", func(t *testing.T) {
+		first := newIssue7521Auth("7521-stream-direct-a")
+		second := newIssue7521Auth("7521-stream-direct-b")
+		exec := &customStreamMockExecutor{
+			identifier: "claude",
+			streamFn: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				if auth.ID == first.ID {
+					return nil, newIssue7521Upstream429("stream first limited", shortHint)
+				}
+				return nil, newIssue7521Upstream429("stream second limited", longHint)
+			},
+		}
+		manager := newIssue7521Manager(t, nil, exec, first, second)
+
+		_, errStream := manager.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: issue7521PoolModel}, cliproxyexecutor.Options{Stream: true})
+		assertIssue7521PoolCooldownError(t, errStream, "stream second limited", shortHint)
+	})
+
+	t.Run("bootstrap chunk error", func(t *testing.T) {
+		first := newIssue7521Auth("7521-stream-boot-a")
+		second := newIssue7521Auth("7521-stream-boot-b")
+		exec := &customStreamMockExecutor{
+			identifier: "claude",
+			streamFn: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+				if auth.ID == first.ID {
+					chunks <- cliproxyexecutor.StreamChunk{Err: newIssue7521Upstream429("bootstrap first limited", shortHint)}
+				} else {
+					chunks <- cliproxyexecutor.StreamChunk{Err: newIssue7521Upstream429("bootstrap second limited", longHint)}
+				}
+				close(chunks)
+				return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+			},
+		}
+		manager := newIssue7521Manager(t, nil, exec, first, second)
+
+		streamRes, errStream := manager.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: issue7521PoolModel}, cliproxyexecutor.Options{Stream: true})
+		if errStream != nil {
+			t.Fatalf("expected streamErrorResult, got direct err: %v", errStream)
+		}
+		chunk, ok := <-streamRes.Chunks
+		if !ok {
+			t.Fatal("expected error chunk on bootstrap failure")
+		}
+		assertIssue7521PoolCooldownError(t, chunk.Err, "bootstrap second limited", shortHint)
+	})
+}
+
+func TestExecute429LeavesOrdinary429UnchangedWhenCandidateAvailable(t *testing.T) {
+	first := newIssue7521Auth("7521-avail-a")
+	second := newIssue7521Auth("7521-avail-b")
+	hint := time.Hour
+
+	exec := &customStreamMockExecutor{
+		identifier: "claude",
+		mockCustomErrorExecutor: mockCustomErrorExecutor{
+			identifier: "claude",
+			executeFn: func(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return cliproxyexecutor.Response{}, newIssue7521Upstream429("single attempt 429", hint)
+			},
+		},
+	}
+	manager := newIssue7521Manager(t, nil, exec, first, second)
+	// Stop after 1 credential attempt with 0 retries so the second credential remains unblocked.
+	manager.SetRetryConfig(0, 0, 1)
+
+	_, errExec := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: issue7521PoolModel}, cliproxyexecutor.Options{})
+	if errExec == nil {
+		t.Fatal("expected 429 error")
+	}
+	if got := statusCodeFromError(errExec); got != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", got)
+	}
+	var marker interface{ IsModelCooldown() bool }
+	if errors.As(errExec, &marker) && marker != nil && marker.IsModelCooldown() {
+		t.Fatalf("ordinary 429 must not report IsModelCooldown() when another candidate is still available: %T (%v)", errExec, errExec)
+	}
+}
+
+func TestExecuteLastCredential429IgnoresZeroWeightCandidateUnderWeightedSelector(t *testing.T) {
+	active := newIssue7521Auth("7521-weight-active")
+	drained := newIssue7521Auth("7521-weight-zero")
+	drained.Attributes["weight"] = "0"
+	hint := 70 * time.Minute
+
+	exec := &customStreamMockExecutor{
+		identifier: "claude",
+		mockCustomErrorExecutor: mockCustomErrorExecutor{
+			identifier: "claude",
+			executeFn: func(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return cliproxyexecutor.Response{}, newIssue7521Upstream429("active credential exhausted", hint)
+			},
+		},
+	}
+	selector := NewSessionAffinitySelector(&WeightedRoundRobinSelector{})
+	manager := newIssue7521Manager(t, selector, exec, active, drained)
+
+	_, errExec := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: issue7521PoolModel}, cliproxyexecutor.Options{})
+	assertIssue7521PoolCooldownError(t, errExec, "active credential exhausted", hint)
+}
+
+func TestAnnotatePoolCooldownSelectionFallbackAndUnblockedGuard(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	fallbackDeadline := now.Add(42 * time.Minute)
+	lastAttemptHint := 3 * time.Hour
+	baseErr := withTrustedRetryAfter(newIssue7521Upstream429("upstream rate limited", lastAttemptHint), &lastAttemptHint)
+
+	t.Run("falls back to selection cooldown when no candidate unblocked", func(t *testing.T) {
+		manager := NewManager(nil, nil, nil)
+		wrapped := manager.annotatePoolCooldownTerminalErrorAt(
+			context.Background(),
+			[]string{"claude"},
+			issue7521PoolModel,
+			cliproxyexecutor.Options{},
+			baseErr,
+			fallbackDeadline,
+			now,
+		)
+		poolErr, ok := wrapped.(*poolCooldownTerminalError)
+		if !ok || poolErr == nil {
+			t.Fatalf("wrapped = %T, want *poolCooldownTerminalError", wrapped)
+		}
+		if !poolErr.deadline.Equal(fallbackDeadline) {
+			t.Fatalf("deadline = %v, want %v", poolErr.deadline, fallbackDeadline)
+		}
+		if !poolErr.IsModelCooldown() {
+			t.Fatal("IsModelCooldown() = false, want true")
+		}
+	})
+
+	t.Run("does not fall back when an eligible candidate is unblocked", func(t *testing.T) {
+		avail := newIssue7521Auth("7521-fallback-avail")
+		exec := &customStreamMockExecutor{identifier: "claude"}
+		manager := newIssue7521Manager(t, nil, exec, avail)
+
+		got := manager.annotatePoolCooldownTerminalErrorAt(
+			context.Background(),
+			[]string{"claude"},
+			issue7521PoolModel,
+			cliproxyexecutor.Options{},
+			baseErr,
+			fallbackDeadline,
+			now,
+		)
+		var marker interface{ IsModelCooldown() bool }
+		if errors.As(got, &marker) && marker != nil && marker.IsModelCooldown() {
+			t.Fatalf("must not wrap as model cooldown when a candidate is unblocked: %T", got)
+		}
+	})
+
+	t.Run("expired pool deadline suppresses raw header and falls back for retryAfterFromError", func(t *testing.T) {
+		cause := headerCarryingError{headers: http.Header{"X-Trace": {"1"}, "Retry-After": {"999"}}}
+		expired := &poolCooldownTerminalError{
+			cause:    cause,
+			deadline: time.Now().Add(-time.Second),
+		}
+		if !HasTrustedRetryDeadline(expired) {
+			t.Fatal("HasTrustedRetryDeadline(expired) = false, want true")
+		}
+		if got := SafeResponseHeaders(expired).Get("Retry-After"); got != "" {
+			t.Fatalf("SafeResponseHeaders(expired) Retry-After = %q, want empty", got)
+		}
+		if got := expired.Headers().Get("X-Trace"); got != "" {
+			t.Fatalf("Headers() X-Trace = %q, want non-allowlisted header suppressed", got)
+		}
+		agg := 2 * time.Second
+		homeTerminal := markHomeRetryRoundExhausted(&poolCooldownTerminalError{
+			cause:    cause,
+			deadline: time.Now().Add(time.Hour),
+		}, &agg, false)
+		if got := SafeResponseHeaders(homeTerminal).Get("Retry-After"); got != "2" {
+			t.Fatalf("Home aggregate Retry-After = %q, want 2", got)
+		}
+	})
+}
+
+// Regression for the review finding: a short transient non-cooldown block on a
+// sibling credential must pull the pool reset forward instead of being ignored,
+// so the wrapped terminal 429 never advertises a longer wait than the pool's
+// earliest auto-recovery.
+func TestExecutePoolCooldownIncludesTransientNonCooldownBlock(t *testing.T) {
+	longQuotaCooldown := 3 * time.Hour
+	shortTransient := 90 * time.Second
+
+	quotaAuth := newIssue7521Auth("7521-mixed-quota")
+	transientAuth := newIssue7521Auth("7521-mixed-transient")
+	execAuth := newIssue7521Auth("7521-mixed-exec")
+
+	exec := &customStreamMockExecutor{
+		identifier: "claude",
+		mockCustomErrorExecutor: mockCustomErrorExecutor{
+			identifier: "claude",
+			executeFn: func(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+				cliproxyexecutor.MarkUpstreamAttempt(ctx)
+				return cliproxyexecutor.Response{}, newIssue7521Upstream429("last credential rate limited", 2*time.Hour)
+			},
+		},
+	}
+	manager := newIssue7521Manager(t, nil, exec, quotaAuth, transientAuth, execAuth)
+
+	// Credential A: genuine quota cooldown recovering in 3h.
+	manager.MarkResult(context.Background(), Result{
+		AuthID:          quotaAuth.ID,
+		Provider:        "claude",
+		Model:           issue7521PoolModel,
+		Success:         false,
+		RetryAfter:      &longQuotaCooldown,
+		CredentialScope: true,
+		Error:           &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"},
+	})
+
+	// Credential B: transient non-cooldown block recovering in 90s. Recording
+	// a transient_rate_limit result (non-credential scope) marks only the
+	// reporting model unavailable without a quota label, so the scan
+	// classifies it as blockReasonOther rather than blockReasonCooldown.
+	manager.MarkResult(context.Background(), Result{
+		AuthID:     transientAuth.ID,
+		Provider:   "claude",
+		Model:      issue7521PoolModel,
+		Success:    false,
+		RetryAfter: &shortTransient,
+		Error: &Error{
+			Code:       ErrorCodeTransientRateLimit,
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    "transient capacity rejection",
+		},
+	})
+
+	// Credential C is the only unblocked candidate; it fails and joins the
+	// pool cooldown. The pool's earliest recovery is B's +90s, not A's +3h nor
+	// the attempt's own 2h hint.
+	_, errExec := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: issue7521PoolModel}, cliproxyexecutor.Options{})
+	assertIssue7521PoolCooldownError(t, errExec, "last credential rate limited", shortTransient)
 }

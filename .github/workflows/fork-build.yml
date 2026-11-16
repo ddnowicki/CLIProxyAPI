@@ -30,7 +30,7 @@ jobs:
       - name: Test
         run: go test -count=1 -skip '^TestToolSearchDisabledMatchesDevGolden$' ./...
       - name: Race regressions
-        run: go test -race -count=1 -run 'Test(PoolCooldown|ModelCooldownErrorClientReset|TerminalPoolCooldown|ClaudePoolCooldown|SharedCooldown)' ./sdk/cliproxy/auth ./sdk/api/handlers/claude
+        run: go test -race -count=1 -run 'Test(PoolCooldown|ModelCooldownErrorClientReset|TerminalPoolCooldown|ClaudePoolCooldown|SharedCooldown|WeightedSessionAffinity|WeightedRoundRobin|Pinned.*Weighted|Execute.*Pool|Execute.*429|AnnotatePoolCooldown)' ./sdk/cliproxy/auth ./sdk/api/handlers/claude
       - name: Build
         run: go build -buildvcs=false -o /tmp/cli-proxy-api ./cmd/server
 
