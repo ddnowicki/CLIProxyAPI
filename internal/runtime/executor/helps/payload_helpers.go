@@ -375,13 +375,13 @@ func applyPayloadConfigWithTrackedPathsForExecutorAndAuthDoc(cfg *config.Config,
 					}
 				}
 			}
-			// Replace text after overrides and before final field deletion.
+			// Replace selected strings after overrides and before final field deletion.
 			for i := range rules.Replace {
 				rule := &rules.Replace[i]
 				if rule.Validate() != nil || !payloadModelRulesMatchDoc(rule.Models, protocol, fromProtocol, headers, doc, root, candidates) {
 					continue
 				}
-				if replacePayloadUserTextDoc(doc, protocol, root, rule, noteRuleWrite) {
+				if replacePayloadTextDoc(doc, protocol, root, rule, i, noteRuleWrite) {
 					mutated = true
 				}
 			}
@@ -411,6 +411,9 @@ func applyPayloadConfigWithTrackedPathsForExecutorAndAuthDoc(cfg *config.Config,
 					}
 				}
 			}
+			// Codex compatibility (#7270/#7384): reconcile only untouched automatic
+			// image tools against the configured reasoning and route. Preserve explicit
+			// tool edits and selection, and never evaluate payload rules a second time.
 			if autoInjectedToolIdx >= 0 && !(userWroteToolChoice && docToolChoiceSelectsImageGeneration(doc, toolChoicePath)) {
 				if codexConfiguredPayloadIncompatibleWithAutoImageGenDoc(doc, root, model, auth, headers) {
 					if retractAutoInjectedImageGenerationToolAtIndexDoc(doc, toolsPath, autoInjectedToolIdx, originalHadEmptyTools) {
