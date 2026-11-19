@@ -2226,8 +2226,10 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 		t.Fatalf("gpt-5.5 max_tokens = %v, want 64000", gpt55["max_tokens"])
 	}
 	serviceTiers, ok := gpt55["service_tiers"].([]any)
-	if !ok || len(serviceTiers) != 1 {
-		t.Fatalf("expected gpt-5.5 priority service tier, got %#v", gpt55["service_tiers"])
+	// Upstream a5e8f69e dropped the gpt-5.5 priority tier from the embedded
+	// catalog; the key must still be present as an empty array.
+	if !ok || len(serviceTiers) != 0 {
+		t.Fatalf("expected gpt-5.5 empty service_tiers array, got %#v", gpt55["service_tiers"])
 	}
 	if custom == nil {
 		t.Fatal("expected custom model codex catalog entry")
