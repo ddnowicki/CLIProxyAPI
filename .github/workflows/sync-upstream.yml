@@ -1,91 +1,194 @@
 name: sync-upstream
 
+# Unattended upstream releases: detect → trial (runs candidate code, no secrets) → publish (App token, runs no repository code).
+# A clean or automatically resolvable merge that passes the fork's tests becomes an auto-merging PR; anything else becomes a
+# `needs-human` PR, which the serwerownia watcher turns into a Grafana alert. See docs/fork-maintenance.md.
+
 on:
   schedule:
-    - cron: '17 4 * * *'
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
-  statuses: write
+  contents: read
 
 concurrency:
   group: sync-upstream
   cancel-in-progress: false
 
 jobs:
-  sync:
+  detect:
     if: github.repository == 'ddnowicki/CLIProxyAPI'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      tag: ${{ steps.detect.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Find a newer stable upstream release
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/router-for-me/CLIProxyAPI/releases/latest --jq .tag_name)"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unexpected upstream tag ${tag}"; exit 1; }
+          current="$(tr -d '\r\n' < .github/upstream-version)"
+          newest="$(printf '%s\n%s\n' "$current" "$tag" | sort -V | tail -n 1)"
+          if [[ "$tag" == "$current" || "$newest" != "$tag" ]]; then
+            echo "master records ${current}; upstream latest is ${tag}; nothing to do"
+            exit 0
+          fi
+          pending="$(gh pr list --repo "$GITHUB_REPOSITORY" --base master --state open --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("upstream/"))] | map(.headRefName) | join(" ")')"
+          if [[ -n "$pending" ]]; then
+            echo "::notice::${tag} waits for the open update PR(s): ${pending}"
+            exit 0
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  trial:
+    needs: detect
+    if: needs.detect.outputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    outputs:
+      strategy: ${{ steps.trial.outputs.strategy }}
+      tree: ${{ steps.trial.outputs.tree }}
+      conflicts: ${{ steps.trial.outputs.conflicts }}
+      reason: ${{ steps.trial.outputs.reason }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: master
           fetch-depth: 0
           persist-credentials: false
-      - name: Merge latest stable release into a candidate branch
-        id: candidate
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="$(gh api repos/router-for-me/CLIProxyAPI/releases/latest --jq .tag_name)"
-          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          current="$(tr -d '\r\n' < .github/upstream-version)"
-          if [[ "$tag" == "$current" ]]; then
-            exit 0
-          fi
-          branch="upstream/${tag}"
-          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --base master --head "$branch" --state open --json number --jq length)"
-          if [[ "$existing" != 0 ]]; then
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git switch -c "$branch"
-          git fetch --no-tags https://github.com/router-for-me/CLIProxyAPI.git "refs/tags/$tag"
-          upstream="$(git rev-parse 'FETCH_HEAD^{commit}')"
-          if ! git merge --no-ff -m "chore: merge upstream ${tag}" "$upstream"; then
-            echo '::error::Upstream merge conflicts require manual review; the deployed branch has not changed.'
-            git merge --abort
-            exit 1
-          fi
-          printf '%s\n' "$tag" > .github/upstream-version
-          git add .github/upstream-version
-          git commit -m "chore: record upstream ${tag}"
-          echo 'sync=true' >> "$GITHUB_OUTPUT"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        if: steps.candidate.outputs.sync == 'true'
         with:
           go-version-file: go.mod
           cache: true
-      - name: Verify candidate without write credentials
-        if: steps.candidate.outputs.sync == 'true'
-        run: |
-          set -euo pipefail
-          go test -count=1 -skip '^TestToolSearchDisabledMatchesDevGolden$' ./...
-          go test -race -count=1 -run 'Test(PoolCooldown|ModelCooldownErrorClientReset|TerminalPoolCooldown|ClaudePoolCooldown|SharedCooldown|WeightedSessionAffinity|WeightedRoundRobin|Pinned.*Weighted|Execute.*Pool|Execute.*429|AnnotatePoolCooldown)' ./sdk/cliproxy/auth ./sdk/api/handlers/claude
-          go build -buildvcs=false -o /tmp/cli-proxy-api ./cmd/server
-      - name: Open tested upstream update PR
-        if: steps.candidate.outputs.sync == 'true'
+      - name: Try strategies until one merges and passes the fork tests
+        id: trial
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BRANCH: ${{ steps.candidate.outputs.branch }}
-          TAG: ${{ steps.candidate.outputs.tag }}
+          TAG: ${{ needs.detect.outputs.tag }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          tools="$RUNNER_TEMP/autoupdate"
+          cp -r .github/autoupdate "$tools"
+          git fetch -q --no-tags https://github.com/router-for-me/CLIProxyAPI.git "refs/tags/${TAG}:refs/tags/${TAG}" || exit 1
+          base="$(git rev-parse HEAD)"
+          conflicts=""
+          reason=""
+          for strategy in default theirs ours; do
+            git merge --abort >/dev/null 2>&1 || true
+            git reset -q --hard "$base"
+            git clean -q -fdx
+            out="$(bash "$tools/merge.sh" "$TAG" "$strategy")"
+            rc=$?
+            if [[ $rc -eq 3 ]]; then
+              [[ -n "$conflicts" ]] || conflicts="$(printf '%s' "$out" | paste -sd, -)"
+              echo "::notice::${strategy}: unresolved conflicts in ${out//$'\n'/, }"
+              reason="conflicts"
+              continue
+            fi
+            [[ $rc -eq 0 ]] || { echo "::error::merge.sh ${strategy} failed (${rc})"; exit 1; }
+            echo "::group::${strategy}: fork tests"
+            bash "$tools/verify.sh"
+            vrc=$?
+            echo "::endgroup::"
+            if [[ $vrc -eq 0 ]]; then
+              { echo "strategy=${strategy}"; echo "tree=$(git rev-parse 'HEAD^{tree}')"; } >> "$GITHUB_OUTPUT"
+              echo "::notice::${TAG} merges with strategy ${strategy} and passes the fork tests"
+              exit 0
+            fi
+            echo "::warning::${strategy}: fork tests failed"
+            reason="tests failed after merge"
+            # Without conflicts every strategy yields the same tree; trying the others is pointless.
+            [[ -n "$conflicts" ]] || break
+          done
+          { echo "conflicts=${conflicts}"; echo "reason=${reason}"; } >> "$GITHUB_OUTPUT"
+          echo "::warning::${TAG} needs a human: ${reason}"
+
+  publish:
+    needs: [detect, trial]
+    if: always() && needs.detect.outputs.tag != '' && needs.trial.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          client-id: ${{ vars.AUTOUPDATE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOUPDATE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recompute the merge, push and open the PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          STRATEGY: ${{ needs.trial.outputs.strategy }}
+          TREE: ${{ needs.trial.outputs.tree }}
+          CONFLICTS: ${{ needs.trial.outputs.conflicts }}
+          REASON: ${{ needs.trial.outputs.reason }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
         run: |
           set -euo pipefail
-          gh auth setup-git
-          git push origin "$BRANCH"
-          head="$(git rev-parse HEAD)"
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${head}" \
-            -f state=success -f context='upstream / tests and build' \
-            -f description='Repository tests, cooldown race regressions and server build passed' \
-            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$BRANCH" \
-            --title "chore: merge upstream ${TAG}" \
-            --body 'Stable upstream release merged with the existing fork changes. Repository tests (with the documented baseline golden exclusion), cooldown race regressions and server build passed. Merge conflicts stop this workflow instead of dropping local patches. Manual approval is required; no production deployment is performed.'
+          git fetch -q --no-tags https://github.com/router-for-me/CLIProxyAPI.git "refs/tags/${TAG}:refs/tags/${TAG}"
+          base="$(git rev-parse HEAD)"
+          branch="upstream/${TAG}"
+          gh label create autoupdate --repo "$GITHUB_REPOSITORY" --color 0e8a16 --description "Automatic upstream update" --force >/dev/null
+          gh label create needs-human --repo "$GITHUB_REPOSITORY" --color d93f0b --description "Automatic upstream update needs manual work" --force >/dev/null
+
+          if [[ -n "$STRATEGY" ]]; then
+            [[ "$STRATEGY" =~ ^(default|theirs|ours)$ && "$TREE" =~ ^[0-9a-f]{40}$ ]]
+            bash .github/autoupdate/merge.sh "$TAG" "$STRATEGY"
+            [[ "$(git rev-parse 'HEAD^{tree}')" == "$TREE" ]] || { echo "::error::recomputed merge differs from the tested tree"; exit 1; }
+            label=autoupdate
+            if [[ "$STRATEGY" == default ]]; then
+              how="merged cleanly"
+            else
+              how="had conflicts that were resolved automatically with \`-X ${STRATEGY}\` ($( [[ "$STRATEGY" == theirs ]] && echo 'upstream side' || echo 'fork side') of each conflicting hunk)"
+            fi
+            body="Upstream release [${TAG}](https://github.com/router-for-me/CLIProxyAPI/releases/tag/${TAG}) ${how} and passed the fork tests in [the sync run](${RUN_URL}). It merges itself once the required checks pass; production picks the image up in the nightly window."
+          else
+            set +e
+            bash .github/autoupdate/merge.sh "$TAG" default >/dev/null
+            rc=$?
+            set -e
+            if [[ $rc -eq 3 ]]; then
+              git -c core.hooksPath=/dev/null add -A
+              git -c core.hooksPath=/dev/null -c user.name=cliproxy-autoupdate -c user.email=cliproxy-autoupdate@users.noreply.github.com \
+                commit -q --no-edit -m "chore: merge upstream ${TAG} (unresolved conflicts)"
+            elif [[ $rc -ne 0 ]]; then
+              exit "$rc"
+            fi
+            git diff --quiet "$base" HEAD -- .github/workflows
+            label=needs-human
+            body="Upstream release [${TAG}](https://github.com/router-for-me/CLIProxyAPI/releases/tag/${TAG}) could not be merged automatically: ${REASON:-unknown}. Strategies tried: default, theirs, ours ([sync run](${RUN_URL})). Conflicting files: ${CONFLICTS:-none}. The branch holds the plain merge (conflict markers committed as-is). Resolve on this branch, then merge; newer releases wait until this PR is closed or merged."
+          fi
+
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${branch}"
+          url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$branch" --title "chore: merge upstream ${TAG}" --label "$label" --body "$body")"
+          echo "$url"
+          if [[ "$label" == autoupdate ]]; then
+            gh pr merge "$url" --auto --merge
+          fi
