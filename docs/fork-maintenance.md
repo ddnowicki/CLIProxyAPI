@@ -14,7 +14,7 @@ The v8.0.75 synchronization was validated on Linux with Go 1.26.11: the full tes
 
 The root `renovate.json` opts this fork into Renovate processing on `master`. Renovate proposes Go module, Docker base-image and GitHub Actions updates, with a three-day minimum release age and no automatic merge. The Renovate GitHub App must be installed for this repository (or for all owner repositories).
 
-The deployment repository picks up the `master` image digest itself in a nightly window (oopsie `cliproxy-bump`).
+The last `fork-build` job on `master` (`deploy`, after `test`, `image-smoke` and the GHCR push) commits the new `:master` digest to `projects/cliproxy/vars.yml` in ddnowicki/oopsie; that push runs the guarded oopsie deploy (smoke test on the real accounts, automatic rollback). The job checks out and runs no fork code; its App token is limited to oopsie contents.
 
 ## Upstream application releases
 
@@ -33,7 +33,7 @@ The upstream workflows (`release.yaml`, `docker-image.yml`, the PR guards) are d
 
 ### One-time setup
 
-- A GitHub App installed only on this repository with Contents, Pull requests and Workflows read/write; its client ID in the Actions variable `AUTOUPDATE_APP_CLIENT_ID`, its private key in the secret `AUTOUPDATE_APP_PRIVATE_KEY`.
+- A GitHub App with Contents, Pull requests and Workflows read/write, installed on this repository and on ddnowicki/oopsie (each job mints a token for one repository: this one in `sync-upstream`, oopsie contents only in `fork-build`'s `deploy`); its client ID in the Actions variable `AUTOUPDATE_APP_CLIENT_ID`, its private key in the secret `AUTOUPDATE_APP_PRIVATE_KEY`.
 - Repository settings: allow auto-merge, delete head branches on merge.
 - A ruleset on `master`: pull request required, required status checks `test` and `image-smoke` (GitHub Actions), no force push, no deletion; the owner may bypass.
 

@@ -168,7 +168,7 @@ jobs:
             else
               how="had conflicts that were resolved automatically with \`-X ${STRATEGY}\` ($( [[ "$STRATEGY" == theirs ]] && echo 'upstream side' || echo 'fork side') of each conflicting hunk)"
             fi
-            body="Upstream release [${TAG}](https://github.com/router-for-me/CLIProxyAPI/releases/tag/${TAG}) ${how} and passed the fork tests in [the sync run](${RUN_URL}). It merges itself once the required checks pass; production picks the image up in the nightly window."
+            body="Upstream release [${TAG}](https://github.com/router-for-me/CLIProxyAPI/releases/tag/${TAG}) ${how} and passed the fork tests in [the sync run](${RUN_URL}). It merges itself once the required checks pass; fork-build then publishes the image and deploys it through oopsie."
           else
             set +e
             bash .github/autoupdate/merge.sh "$TAG" default >/dev/null
