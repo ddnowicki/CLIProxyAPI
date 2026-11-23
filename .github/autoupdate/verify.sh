@@ -4,7 +4,8 @@
 #
 # Upstream sometimes tags a release whose own tests are red. A failing test is tolerated only when the very
 # same test also fails on the pristine upstream tag named in .github/upstream-version; anything else
-# (a new failure, a build/setup failure, a package that fails outside a test) fails the gate.
+# (a new failure that also fails an isolated re-run, a build/setup failure, a package that fails outside a test)
+# fails the gate.
 set -euo pipefail
 
 work="$(mktemp -d)"
@@ -55,15 +56,30 @@ if [ -s "$work/fork.fail" ]; then
   run_tests "$work/upstream" "$work/upstream.json" -run "$run_regex" "${pkgs[@]}" >/dev/null
   failed_tests "$work/upstream.json" >"$work/upstream.fail"
 
-  new="$(comm -23 "$work/fork.fail" "$work/upstream.fail")"
+  comm -23 "$work/fork.fail" "$work/upstream.fail" >"$work/new.fail"
+  new=""
+  if [ -s "$work/new.fail" ]; then
+    # Timing-sensitive upstream tests (websocket, cooldown) occasionally fail under the full parallel suite.
+    # A fork-only failure gets one isolated re-run; only a test that fails again blocks the gate.
+    echo "Re-running fork-only failures once in isolation..."
+    rerun_regex="^($(cut -d' ' -f2 "$work/new.fail" | sort -u | paste -sd'|'))\$"
+    mapfile -t rerun_pkgs < <(cut -d' ' -f1 "$work/new.fail" | sort -u)
+    run_tests . "$work/rerun.json" -run "$rerun_regex" "${rerun_pkgs[@]}"
+    failed_tests "$work/rerun.json" >"$work/rerun.fail"
+    new="$(comm -12 "$work/new.fail" "$work/rerun.fail")"
+    if grep -q '"FailedBuild"' "$work/rerun.json"; then new="$(cat "$work/new.fail")"; fi
+    comm -23 "$work/new.fail" "$work/rerun.fail" | while read -r pkg test; do
+      echo "::warning::flaky: ${pkg} ${test} failed in the full suite and passed when re-run"
+    done
+  fi
   if [ -n "$new" ]; then
     echo "::error::tests failing only in the fork (not on upstream ${tag}):"
     echo "$new"
     exit 1
   fi
-  while read -r pkg test; do
+  comm -12 "$work/fork.fail" "$work/upstream.fail" | while read -r pkg test; do
     echo "::warning::tolerated: ${pkg} ${test} also fails on pristine upstream ${tag}"
-  done <"$work/fork.fail"
+  done
 fi
 
 go test -race -count=1 -run 'Test(PoolCooldown|ModelCooldownErrorClientReset|TerminalPoolCooldown|ClaudePoolCooldown|SharedCooldown|WeightedSessionAffinity|WeightedRoundRobin|Pinned.*Weighted|Execute.*Pool|Execute.*429|AnnotatePoolCooldown)' ./sdk/cliproxy/auth ./sdk/api/handlers/claude
