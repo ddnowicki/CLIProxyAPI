@@ -20,10 +20,10 @@ The last `fork-build` job on `master` (`deploy`, after `test`, `image-smoke` and
 
 `sync-upstream` checks the latest stable upstream release every 15 minutes and is fully unattended:
 
-1. **detect** compares `releases/latest` with `.github/upstream-version`. One update is in flight at a time: while any `upstream/*` pull request is open, newer releases wait.
+1. **detect** compares `releases/latest` with `.github/upstream-version`. One update is in flight at a time: an open `autoupdate` pull request (or a `needs-human` one for the same release) makes newer releases wait. A `needs-human` pull request for an older release does not: the newer release is tried and that pull request is closed as superseded, because upstream often fixes a broken release within hours.
 2. **trial** (no secrets, runs candidate code) merges the tag with `.github/autoupdate/merge.sh`, first plainly, then — only when there are conflicts — with `-X theirs` (upstream side of each conflicting hunk) and `-X ours` (fork side). Every merge restores `.github/workflows` to master's content, so upstream workflows never enter the fork, and records the tag in `.github/upstream-version`. The first strategy whose merge passes `.github/autoupdate/verify.sh` (the full suite, the fork race regressions and the server build) wins. The fork contract tests (`fork_pool_cooldown_test.go`, `code_handlers_fork_pool_cooldown_test.go`) are what makes automatic conflict resolution safe: a strategy that drops a fork patch fails them.
 3. **publish** (GitHub App token, runs no repository code) recomputes the winning merge, checks that its tree is the tested tree and that the workflow tree equals master, pushes `upstream/<tag>` and opens a pull request labelled `autoupdate` with auto-merge enabled. The required checks (`test`, `image-smoke`) run again on the pull request.
-4. When no strategy works, the pull request carries the plain merge (conflict markers committed as-is) and the label `needs-human`, without auto-merge. Resolve it on that branch.
+4. When no strategy works, the pull request carries the plain merge (conflict markers committed as-is) and the label `needs-human`, without auto-merge. Resolve it on that branch, or let the next upstream release supersede it.
 
 The serwerownia watcher (oopsie `projects/cliproxy`) reads this repository's public API and alerts through Grafana/Discord on a `needs-human` pull request, an update pull request open for more than three hours, a failing `sync-upstream` run, or a release not deployed within 48 hours.
 
