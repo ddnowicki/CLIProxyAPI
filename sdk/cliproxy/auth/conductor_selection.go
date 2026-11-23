@@ -3290,11 +3290,7 @@ func (m *Manager) earliestPoolCooldownForModelAt(ctx context.Context, providers 
 	totalCandidates := 0
 	cooling := 0
 	for _, candidate := range m.auths {
-<<<<<<< HEAD
-		if candidate == nil || candidate.Disabled || candidate.Status == StatusDisabled {
-=======
 		if isAuthDisabled(candidate) {
->>>>>>> 85225381d89915595598ed13766cd79890c03a84
 			continue
 		}
 		if excludeZeroWeight && authWeight(candidate) <= 0 {
