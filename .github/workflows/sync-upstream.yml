@@ -26,6 +26,7 @@ jobs:
       pull-requests: read
     outputs:
       tag: ${{ steps.detect.outputs.tag }}
+      supersede: ${{ steps.detect.outputs.supersede }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -46,13 +47,19 @@ jobs:
             echo "master records ${current}; upstream latest is ${tag}; nothing to do"
             exit 0
           fi
-          pending="$(gh pr list --repo "$GITHUB_REPOSITORY" --base master --state open --json headRefName \
-            --jq '[.[] | select(.headRefName | startswith("upstream/"))] | map(.headRefName) | join(" ")')"
+          # An update PR in flight (autoupdate, or needs-human for this same tag) blocks newer releases. A needs-human
+          # PR for an older tag does not: the newer release is tried and that PR is closed as superseded in publish.
+          updates="$(gh pr list --repo "$GITHUB_REPOSITORY" --base master --state open --json number,headRefName,labels \
+            --jq '[.[] | select(.headRefName | startswith("upstream/"))]')"
+          pending="$(jq -r --arg branch "upstream/${tag}" \
+            '[.[] | select(([.labels[].name] | index("needs-human") | not) or .headRefName == $branch) | .headRefName] | join(" ")' <<< "$updates")"
           if [[ -n "$pending" ]]; then
             echo "::notice::${tag} waits for the open update PR(s): ${pending}"
             exit 0
           fi
+          supersede="$(jq -r '[.[].number] | join(" ")' <<< "$updates")"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "supersede=${supersede}" >> "$GITHUB_OUTPUT"
 
   trial:
     needs: detect
@@ -145,6 +152,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ needs.detect.outputs.tag }}
+          SUPERSEDE: ${{ needs.detect.outputs.supersede }}
           STRATEGY: ${{ needs.trial.outputs.strategy }}
           TREE: ${{ needs.trial.outputs.tree }}
           CONFLICTS: ${{ needs.trial.outputs.conflicts }}
@@ -158,6 +166,11 @@ jobs:
           branch="upstream/${TAG}"
           gh label create autoupdate --repo "$GITHUB_REPOSITORY" --color 0e8a16 --description "Automatic upstream update" --force >/dev/null
           gh label create needs-human --repo "$GITHUB_REPOSITORY" --color d93f0b --description "Automatic upstream update needs manual work" --force >/dev/null
+          for number in $SUPERSEDE; do
+            [[ "$number" =~ ^[0-9]+$ ]] || continue
+            gh pr close "$number" --repo "$GITHUB_REPOSITORY" --delete-branch \
+              --comment "Superseded by upstream ${TAG}, which the sync tries instead ([run](${RUN_URL}))."
+          done
 
           if [[ -n "$STRATEGY" ]]; then
             [[ "$STRATEGY" =~ ^(default|theirs|ours)$ && "$TREE" =~ ^[0-9a-f]{40}$ ]]
