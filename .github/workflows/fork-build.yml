@@ -27,21 +27,33 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Test
-        run: go test -count=1 -skip '^TestToolSearchDisabledMatchesDevGolden$' ./...
-      - name: Race regressions
-        run: go test -race -count=1 -run 'Test(PoolCooldown|ModelCooldownErrorClientReset|TerminalPoolCooldown|ClaudePoolCooldown|SharedCooldown|WeightedSessionAffinity|WeightedRoundRobin|Pinned.*Weighted|Execute.*Pool|Execute.*429|AnnotatePoolCooldown)' ./sdk/cliproxy/auth ./sdk/api/handlers/claude
-      - name: Build
-        run: go build -buildvcs=false -o /tmp/cli-proxy-api ./cmd/server
+      - name: Test, race regressions and build
+        run: bash .github/autoupdate/verify.sh
+
+  image-smoke:
+    if: github.repository == 'ddnowicki/CLIProxyAPI'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build candidate image
+        run: docker build -q -t cliproxy-candidate:ci --build-arg VERSION=ci --build-arg COMMIT="$GITHUB_SHA" .
+      - name: Boot, probe and check rollback compatibility
+        run: bash .github/autoupdate/image-smoke.sh cliproxy-candidate:ci ghcr.io/ddnowicki/cliproxyapi:master
 
   image:
-    needs: test
+    needs: [test, image-smoke]
     if: github.repository == 'ddnowicki/CLIProxyAPI' && github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -86,3 +98,56 @@ jobs:
           DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           echo "ghcr.io/ddnowicki/cliproxyapi:master@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+
+  # Last step: pin the published digest in oopsie. The push to oopsie main triggers its normal deploy, which smoke-tests
+  # the image on serwerownia and rolls back by itself. This job checks out no fork code and runs none; the App token is
+  # limited to oopsie contents.
+  deploy:
+    needs: image
+    if: github.repository == 'ddnowicki/CLIProxyAPI' && github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    concurrency:
+      group: oopsie-cliproxy-bump
+      cancel-in-progress: false
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          client-id: ${{ vars.AUTOUPDATE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOUPDATE_APP_PRIVATE_KEY }}
+          owner: ddnowicki
+          repositories: oopsie
+          permission-contents: write
+      - name: Bump projects/cliproxy/vars.yml in oopsie
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+          VERSION: ${{ needs.image.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest"; exit 1; }
+          image="ghcr.io/ddnowicki/cliproxyapi:master@${DIGEST}"
+          for attempt in 1 2 3 4 5; do
+            rm -rf oopsie
+            git clone -q --depth 1 "https://x-access-token:${TOKEN}@github.com/ddnowicki/oopsie.git" oopsie
+            file=oopsie/projects/cliproxy/vars.yml
+            [[ "$(grep -c '^IMAGE: ghcr\.io/ddnowicki/cliproxyapi:master@sha256:[0-9a-f]\{64\}$' "$file")" == 1 ]] \
+              || { echo "::error::oopsie vars.yml has no single pinned IMAGE line"; exit 1; }
+            if grep -qxF "IMAGE: ${image}" "$file"; then
+              echo "oopsie already deploys ${image}"
+              exit 0
+            fi
+            sed -i "s#^IMAGE: ghcr\.io/ddnowicki/cliproxyapi:master@sha256:[0-9a-f]\{64\}\$#IMAGE: ${image}#" "$file"
+            git -C oopsie -c user.name='cliproxy-autoupdate[bot]' -c user.email='cliproxy-autoupdate[bot]@users.noreply.github.com' \
+              commit -q -m "chore(cliproxy): deploy ${VERSION}" -m "Tested fork image ${image} (ddnowicki/CLIProxyAPI@${GITHUB_SHA})." -- projects/cliproxy/vars.yml
+            if git -C oopsie push -q origin HEAD:main; then
+              echo "oopsie now deploys ${image}" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::warning::push to oopsie main raced another commit (attempt ${attempt}); retrying"
+            sleep $((attempt * 5))
+          done
+          exit 1
