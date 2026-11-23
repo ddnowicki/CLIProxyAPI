@@ -82,7 +82,8 @@ jobs:
           TAG: ${{ needs.detect.outputs.tag }}
         shell: bash
         run: |
-          set -uo pipefail
+          # `shell: bash` runs with -e; this loop handles every exit code itself (3 = conflicts, verify failures).
+          set +e -uo pipefail
           tools="$RUNNER_TEMP/autoupdate"
           cp -r .github/autoupdate "$tools"
           git fetch -q --no-tags https://github.com/router-for-me/CLIProxyAPI.git "refs/tags/${TAG}:refs/tags/${TAG}" || exit 1
